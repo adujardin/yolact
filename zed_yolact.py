@@ -7,7 +7,8 @@ from utils.functions import SavePath
 from layers.output_utils import postprocess, undo_image_transformation
 import pycocotools
 
-from data import cfg, set_cfg
+from data import cfg, set_cfg, mask_type
+import torch.nn.functional as F
 
 import numpy as np
 import torch
@@ -113,8 +114,10 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
         
         if cfg.eval_mask_branch:
             # Masks are drawn on the GPU, so don't copy
-            masks = t[3][idx]
+            masks = t[4][idx]
+
         classes, scores, boxes = [x[idx].cpu().numpy() for x in t[:3]]
+        distances = t[3][0]
 
     num_dets_to_consider = min(args.top_k, classes.shape[0])
     for j in range(num_dets_to_consider):
@@ -195,13 +198,14 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
             x1, y1, x2, y2 = boxes[j, :]
             color = get_color(j)
             score = scores[j]
+            distance = distances[j]
 
             if args.display_bboxes:
                 cv2.rectangle(img_numpy, (x1, y1), (x2, y2), color, 1)
 
             if args.display_text:
                 _class = cfg.dataset.class_names[classes[j]]
-                text_str = '%s: %.2f' % (_class, score) if args.display_scores else _class
+                text_str = '%s: %.2f (%.2f m)' % (_class, score, distance)
 
                 font_face = cv2.FONT_HERSHEY_DUPLEX
                 font_scale = 0.6
@@ -214,8 +218,7 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
 
                 cv2.rectangle(img_numpy, (x1, y1), (x1 + text_w, y1 - text_h - 4), color, -1)
                 cv2.putText(img_numpy, text_str, text_pt, font_face, font_scale, text_color, font_thickness, cv2.LINE_AA)
-            
-    
+
     return img_numpy
 
 
@@ -322,7 +325,8 @@ def evalzed(net: Yolact, path: str, out_path: str = None):
     zed = sl.Camera()
     init = sl.InitParameters()
     init.camera_resolution = sl.RESOLUTION.HD720
-    init.depth_mode = sl.DEPTH_MODE.NONE
+    init.depth_mode = sl.DEPTH_MODE.ULTRA
+    init.coordinate_units = sl.UNIT.METER
 
     if path is not None and not path.isdigit():
         is_svo = True
@@ -337,9 +341,10 @@ def evalzed(net: Yolact, path: str, out_path: str = None):
     print("ZED camera opened")
 
     target_fps = round(zed.get_camera_information().camera_fps)
-    frame_width = 1280#round(zed.get_camera_information().camera_resolution.width)
-    frame_height = 720#round(zed.get_camera_information().camera_resolution.height)
-    resolution_ = sl.Resolution(frame_width, frame_height);
+    frame_width = 1280 #round(zed.get_camera_information().camera_resolution.width)
+    frame_height = 720 #round(zed.get_camera_information().camera_resolution.height)
+    resolution_ = sl.Resolution(frame_width, frame_height)
+    resolution_depth = sl.Resolution(frame_width / 8., frame_height / 8.)
 
     if is_svo:
         num_frames = float('inf')
@@ -370,15 +375,80 @@ def evalzed(net: Yolact, path: str, out_path: str = None):
 
     def get_next_frame(zed):
         mat = sl.Mat()
+        depth_mat = sl.Mat()
         zed.grab()
         zed.retrieve_image(mat, sl.VIEW.LEFT, resolution=resolution_)
         frame = cv2.cvtColor(mat.get_data(), cv2.COLOR_RGBA2RGB)
-        return [frame]
+        zed.retrieve_measure(depth_mat, sl.MEASURE.DEPTH, resolution=resolution_depth)
+        return [(frame, depth_mat)]
 
     def transform_frame(frames):
         with torch.no_grad():
-            frames = [torch.from_numpy(frame).cuda().float() for frame in frames]
-            return frames, transform(torch.stack(frames, 0))
+            frames2 = []
+            frames_left = []
+            for i in range(len(frames)):
+                img_tensor = torch.from_numpy(frames[i][0]).cuda().float()
+                frames2.append((img_tensor, frames[i][1]))
+                frames_left.append(img_tensor)
+            return frames2, transform(torch.stack(frames_left, 0))
+
+    def extract_depth(frames, imgs):
+        interpolation_mode = 'bilinear'
+        batch_idx = 0
+        dets = imgs[batch_idx]['detection']
+        score_threshold = 0
+
+        depth = frames[0][1]
+        w = depth.get_width()
+        h = depth.get_height()
+
+        if dets is not None:
+            if score_threshold > 0:
+                keep = dets['score'] > score_threshold
+                for k in dets:
+                    if k != 'proto':
+                        dets[k] = dets[k][keep]
+
+            # Actually extract everything from dets now
+            boxes = dets['box']
+            masks = dets['mask']
+            if cfg.mask_type == mask_type.lincomb:
+                # At this points masks is only the coefficients
+                proto_data = dets['proto']
+                masks = proto_data @ masks.t()
+                masks = cfg.mask_proto_mask_activation(masks)
+                # Permute into the correct output shape [num_dets, proto_h, proto_w]
+                masks = masks.permute(2, 0, 1).contiguous()
+                # Scale masks up to the full image
+                masks = F.interpolate(masks.unsqueeze(0), (h, w), mode=interpolation_mode, align_corners=False).squeeze(0)
+                # Binarize the masks
+                masks.gt_(0.5)
+            elif cfg.mask_type == mask_type.direct:
+                # Upscale masks
+                full_masks = torch.zeros(masks.size(0), h, w)
+                for jdx in range(masks.size(0)):
+                    x1, y1, x2, y2 = boxes[jdx, :]
+                    mask_w = x2 - x1
+                    mask_h = y2 - y1
+                    # Just in case
+                    if mask_w * mask_h <= 0 or mask_w < 0:
+                        continue
+                    mask = masks[jdx, :].view(1, 1, cfg.mask_size, cfg.mask_size)
+                    mask = F.interpolate(mask, (mask_h, mask_w), mode=interpolation_mode, align_corners=False)
+                    mask = mask.gt(0.5).float()
+                    full_masks[jdx, y1:y2, x1:x2] = mask
+                masks = full_masks
+
+            masks = masks.cpu().numpy()
+            object_dist_list = []
+            # Extract depth from masks
+            np_depth_flat = np.array(depth.get_data()).flatten()
+            for mask in masks:
+                thresh = np.array(np.squeeze(mask[:, :]).astype(bool)).flatten()
+                x = np_depth_flat[thresh > 0]
+                object_dist_list.append(np.nanmedian(x[np.isfinite(x)]))
+            imgs[batch_idx]['detection']['distance'] = [object_dist_list]
+        return frames, imgs
 
     def eval_network(inp):
         with torch.no_grad():
@@ -389,6 +459,9 @@ def evalzed(net: Yolact, path: str, out_path: str = None):
             out = net(imgs)
             if num_extra > 0:
                 out = out[:-num_extra]
+
+            # Get 3D detection from 2D output and depth
+            frames, imgs = extract_depth(frames, out)
             return frames, out
 
     def prep_frame(inp, fps_str):
@@ -462,7 +535,7 @@ def evalzed(net: Yolact, path: str, out_path: str = None):
             traceback.print_exc()
 
     extract_frame = lambda x, i: (
-    x[0][i] if x[1][i]['detection'] is None else x[0][i].to(x[1][i]['detection']['box'].device), [x[1][i]])
+    x[0][0][i] if x[1][i]['detection'] is None else x[0][0][i].to(x[1][i]['detection']['box'].device), [x[1][i]])
 
     # Prime the network on the first frame because I do some thread unsafe things otherwise
     print('Initializing model... ', end='')
@@ -542,7 +615,6 @@ def evalzed(net: Yolact, path: str, out_path: str = None):
         print('\nStopping...')
 
     cleanup_and_exit()
-
 
 def evaluate(net:Yolact):
     net.detect.use_fast_nms = args.fast_nms

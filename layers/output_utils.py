@@ -43,7 +43,7 @@ def postprocess(det_output, w, h, batch_idx=0, interpolation_mode='bilinear',
         keep = dets['score'] > score_threshold
 
         for k in dets:
-            if k != 'proto':
+            if k != 'proto' and k != 'distance':
                 dets[k] = dets[k][keep]
         
         if dets['score'].size(0) == 0:
@@ -54,6 +54,7 @@ def postprocess(det_output, w, h, batch_idx=0, interpolation_mode='bilinear',
     boxes   = dets['box']
     scores  = dets['score']
     masks   = dets['mask']
+    distances   = dets['distance']
 
     if cfg.mask_type == mask_type.lincomb and cfg.eval_mask_branch:
         # At this points masks is only the coefficients
@@ -119,7 +120,7 @@ def postprocess(det_output, w, h, batch_idx=0, interpolation_mode='bilinear',
         
         masks = full_masks
 
-    return classes, scores, boxes, masks
+    return classes, scores, boxes, distances, masks
 
 
     
